@@ -21,6 +21,7 @@ The graph then pauses at a checkpointed **approval gate** when the amount is ove
 - [Configuration](#configuration)
 - [API walkthrough](#api-walkthrough)
 - [Human-in-the-loop approval](#human-in-the-loop-approval)
+- [Sample output](#sample-output)
 - [Hybrid RAG and citations](#hybrid-rag-and-citations)
 - [Google OAuth 2.0 and Sheets](#google-oauth-20-and-sheets)
 - [MCP supplier tools](#mcp-supplier-tools)
@@ -169,6 +170,8 @@ Services:
 | MCP | `http://localhost:8100/mcp` | Streamable HTTP transport |
 
 The first start downloads the local embedding and reranker models into the `model_cache` volume, so it can take several minutes. The API health check has a 180-second start period for this reason.
+
+If port `8000` is already in use, stop the local server first (`pkill -f 'uvicorn app.main:app'`). On Linux, non-root users may need `sudo docker compose ...` or membership in the `docker` group to access the Docker socket.
 
 ### 3. Verify
 
@@ -388,6 +391,145 @@ On resume, the API validates the decision against Pydantic, removes the thread f
 
 ---
 
+## Sample output
+
+The responses below were captured from a real local run with the in-memory checkpointer and the clearly labelled demo budget ledger (Postgres and Redis disabled). That is why `/health` reports `degraded` and `budget.source` is `local_demo`; the workflow, agent outputs, approval gate and resume path are the same as in Compose. Citations and long snippets are omitted here for readability.
+
+### Health
+
+```console
+$ curl -s http://localhost:8000/health
+```
+
+```json
+{
+  "status": "degraded",
+  "app": "ProcureFlow",
+  "environment": "development",
+  "database": "disabled",
+  "redis": "unavailable",
+  "vector_documents": 20,
+  "llm": {"groq": true, "gemini": true, "mock": true},
+  "langsmith": false
+}
+```
+
+### Create request → awaiting approval
+
+```console
+$ curl -s -X POST http://localhost:8000/api/v1/requests \
+    -H 'Content-Type: application/json' \
+    -d '{"request":"Buy 20 laptops, budget 30k USD","requester":"demo@example.com"}'
+```
+
+```json
+{
+  "thread_id": "a27fdc86-ff05-4c4b-a24b-9e37651c75d5",
+  "status": "awaiting_approval",
+  "requester": "demo@example.com",
+  "user_request": "Buy 20 laptops, budget 30k USD",
+  "parsed_request": {
+    "item": "laptops",
+    "quantity": 20,
+    "total_amount_usd": 30000.0,
+    "currency": "USD",
+    "category": "laptops",
+    "confidence": 0.9
+  },
+  "policy": {
+    "compliant": true,
+    "requires_approval": true,
+    "rationale": "Amount is USD 30,000. CFO approval is required above the configured threshold.",
+    "confidence": 0.9
+  },
+  "suppliers": {
+    "recommended_supplier": "Orbit Systems",
+    "confidence": 0.88
+  },
+  "budget": {
+    "available_usd": 78000.0,
+    "requested_usd": 30000.0,
+    "within_budget": true,
+    "source": "local_demo"
+  },
+  "risk": {
+    "approval_required": true,
+    "reasons": [
+      "Amount USD 30,000.00 exceeds the USD 10,000 delegated limit.",
+      "Policy requires human approval."
+    ]
+  },
+  "interrupt": {
+    "amount_usd": 30000.0,
+    "recommended_supplier": "Orbit Systems",
+    "recommended_total_usd": 25500.0,
+    "budget_available_usd": 78000.0
+  },
+  "can_resume": true
+}
+```
+
+### Approve → resumed recommendation
+
+```console
+$ curl -s -X POST http://localhost:8000/api/v1/requests/<thread_id>/approve \
+    -H 'Content-Type: application/json' \
+    -d '{"approver":"CFO","comment":"approved"}'
+```
+
+```json
+{
+  "thread_id": "a27fdc86-ff05-4c4b-a24b-9e37651c75d5",
+  "status": "approved",
+  "approval": {
+    "decision": "approve",
+    "approver": "CFO",
+    "comment": "approved",
+    "decided_at": "2026-11-12T17:19:54.614026+00:00"
+  },
+  "recommendation": {
+    "status": "approved",
+    "chosen_supplier": "Orbit Systems",
+    "total_amount_usd": 25500.0,
+    "supplier_rationale": "Rated 4.8/5, 12 day lead time Lead time 12 days.",
+    "policy_summary": "Policy compliant. Approval required. POL-001 Purchase approval thresholds, POL-002 Budget availability and no split purchases",
+    "budget_summary": "Within budget (USD 78,000 available, source: local_demo).",
+    "confidence": 0.85
+  },
+  "can_resume": false
+}
+```
+
+The same checkpoint was then read back with `GET /api/v1/requests/<thread_id>` and still returned `status: "approved"`, confirming that the human decision survived the resume rather than restarting the workflow.
+
+### Latest measured RAGAS run
+
+Full 27-question run on 2026-11-12 (Groq free tier). Scores are means over the samples the judge actually returned; the free tier rate-limited some judge calls, so coverage is shown rather than hidden.
+
+| Metric | Score | Samples scored |
+| --- | ---: | ---: |
+| Faithfulness | 0.9368 | 19/27 |
+| Answer relevancy | 0.8712 | 20/27 |
+| Context precision | 0.9815 | 18/27 |
+| Context recall | 1.0000 | 8/27 |
+
+The generated report, including run configuration and caveats, is in [`docs/eval_results.md`](docs/eval_results.md).
+
+### Offline verification
+
+```console
+$ MOCK_LLM=true .venv/bin/python -m pytest
+85 passed, 1 warning in 2.68s
+
+$ .venv/bin/python -m ruff check .
+All checks passed!
+
+$ .venv/bin/python -m ruff format --check .
+48 files already formatted
+```
+
+---
+
 ## Hybrid RAG and citations
 
 The bundled corpus (`rag/data/documents.jsonl`) contains **20 fictional documents**: 12 supplier catalogues and 8 procurement policies (`POL-001` … `POL-008`). No real supplier, employee or customer data is used.
@@ -471,7 +613,7 @@ The harness:
 - uses a separate free-tier Groq judge,
 - writes only metrics that were actually returned to [`docs/eval_results.md`](docs/eval_results.md), including per-metric sample coverage.
 
-Measured results from the latest full run are published in [`docs/eval_results.md`](docs/eval_results.md). Numbers are intentionally not hard-coded in this README; the report is generated by the harness. The free Groq tier applies per-minute and per-day token limits, so individual judge calls can fail; the report records how many samples contributed, and failed calls are never replaced with invented scores. A 20-document synthetic corpus with 27 questions is a pipeline smoke test, not a claim of production retrieval quality.
+Measured results from the latest full run are published in [`docs/eval_results.md`](docs/eval_results.md) and reproduced as a dated snapshot in the [sample output](#sample-output) above. The report is generated by the harness; treat the README table as a snapshot, not a live guarantee. The free Groq tier applies per-minute and per-day token limits, so individual judge calls can fail; the report records how many samples contributed, and failed calls are never replaced with invented scores. A 20-document synthetic corpus with 27 questions is a pipeline smoke test, not a claim of production retrieval quality.
 
 Useful flags:
 
@@ -566,7 +708,7 @@ pyproject.toml       Dependencies, extras, Ruff/pytest config
 
 ## Limitations and next steps
 
-- **The full Compose stack was not started end-to-end in this environment.** The Docker CLI was unavailable here (Podman 5.7 only), so the Compose file is provided and reviewed but was not launched as a single stack. Its two stateful dependencies were run separately with Podman: real PostgreSQL 16 + pgvector and Redis, against which corpus ingestion, pgvector retrieval, checkpointed start, approval, resume and reload-from-a-fresh-runtime all passed. The API container build itself remains unexercised.
+- **The Compose images build, but the stack was not left running end-to-end here.** `docker compose up --build` successfully built both the `app` and `mcp` images and started the PostgreSQL/pgvector and Redis containers. The `app` container then failed only because host port `8000` was already occupied by a local uvicorn process; that is a host port conflict, not a build or configuration error. Stop the local server before retrying. Non-root Docker socket access on this machine also required `sudo` (or adding the user to the `docker` group). Earlier real Podman runs of PostgreSQL 16 + pgvector and Redis validated corpus ingestion, pgvector retrieval, checkpointed start, approval, resume and reload from a fresh runtime.
 - **Google Sheets/OAuth live flow is not completed here** because no spreadsheet ID or browser consent/refresh token was available. The OAuth state/CSRF/token-exchange logic and Sheets parsing/retry logic are unit-tested with fakes.
 - **Postgres checkpointer + pgvector were verified against a real database**, but only in single-node Podman runs with the hash embedder for speed. The sentence-transformers path was verified against the in-memory store, not against pgvector with 384-dimension vectors; the schema and dimension are configurable and tested, but a full-size embedding ingest is left to the Compose quickstart.
 - **No frontend.** A minimal React approval page was an optional stretch goal and is not included; Swagger and curl are the review interface.
