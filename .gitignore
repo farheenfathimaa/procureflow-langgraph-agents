@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+client_secret*.json
+credentials.json
+token.json
+*token*.json
+!**/tests/fixtures/*.json
+*.pem
+*.key
+
+# Runtime data, Docker volumes and OAuth token storage
+/data/
+.google/
+.oauth/
+pgdata/
+redisdata/
+postgres-data/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Logs
+*.log
+logs/
+
+# IDEs and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local evaluation artefacts (keep the published report)
+evals/.cache/
+evals/results/
+.eval_cache/
